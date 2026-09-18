@@ -43,6 +43,3 @@ MANIFEST.ini
 # Basic package build artifacts
 build-basic/
 dist-basic/
-
-# Scraped data / analysis output
-jobs.db
