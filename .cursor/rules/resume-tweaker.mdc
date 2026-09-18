@@ -1,0 +1,16 @@
+---
+alwaysApply: true
+---
+# resume-tweaker (Cursor)
+
+Follow `specs/002-resume-tweaker/spec.md` + `docs/resume-tweaker-architecture.md`.
+
+- DB: `jobs` + `job_analysis` (existing, read-only schema) → new `job_groups`, `tweak_suggestions`, `resume_versions`.
+- Groq free tier only (live catalog 2026-09-19):
+  - rewrite/suggest = `openai/gpt-oss-120b` (fallback `qwen/qwen3.8-27b`)
+  - grouping = `openai/gpt-oss-20b` (fallback `qwen/qwen3.8-27b`)
+  - `temperature=0`, JSON mode, backoff on 429. No preview models.
+- Secrets: `GROQ_API_KEY` from env/`.env` only. Never emit or commit keys.
+- Human-in-the-loop is load-bearing: `accept` uses suggestion, `edit`/`custom` merges `user_text`, `skip` writes nothing. `rewrite` must read the stored decision.
+- No hallucinated employers/dates/metrics. Missing evidence → `"evidence": null`.
+- Tests must mock Groq (no network): `pytest tests/test_resume_tweaker.py`.

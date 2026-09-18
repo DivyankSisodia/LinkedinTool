@@ -150,10 +150,17 @@ async def scrape_job_details(page, url):
         const rangeMatch = body.match(/Data ranges from ([\\d,]+) to ([\\d,]+)/);
         if (rangeMatch) result.headcount = parseInt(rangeMatch[2].replace(/,/g, ''), 10);
 
-        // --- Title from <h1> (login/join walls have a generic h1) ---
+        // --- Title: h1 first, then document.title fallback ---
+        // 2026 layout renders the title in an obfuscated <p> (no h1 on page),
+        // but document.title is reliable: "<Title> | <Company> | LinkedIn".
+        let rawTitle = null;
         const h1 = document.querySelector('h1');
-        const rawTitle = h1 ? h1.innerText.trim().split('\\n')[0].trim() : null;
-        result.title = (rawTitle && !/^(Join LinkedIn|Sign in|LinkedIn)$/i.test(rawTitle))
+        if (h1) rawTitle = h1.innerText.trim().split('\\n')[0].trim();
+        if (!rawTitle) {
+            const dt = (document.title || '').split('|')[0].trim();
+            if (dt) rawTitle = dt;
+        }
+        result.title = (rawTitle && !/^(Join LinkedIn|Join now|Sign in|Sign up|Log in|LinkedIn|Feed|Jobs)$/i.test(rawTitle))
             ? rawTitle : null;
 
         // --- Location, Posted, Applicants from page text ---
@@ -161,6 +168,20 @@ async def scrape_job_details(page, url):
         //   "<title>" then "<Company>  <Location>" then "<posted>  <applicants>"
         // Old layout fallback: "Location · Posted · Applicants"
         const lines = body.split('\\n').map(l => l.trim()).filter(Boolean);
+
+        // Third fallback: 2026 layout puts company on one line, title on the next.
+        const titleSkip = /^(Apply|Save|Remote|On-site|Hybrid|Full-time|Part-time|Contract|Internship|Promoted|Try Premium|Use AI|Get AI-powered|Show match|Tailor my|Help me|About the job|People you can reach|Meet the hiring|Message|Home|My Network|Jobs|Messaging|Notifications|Me|For Business)/i;
+        if (!result.title && result.company) {
+            const coIdx = lines.findIndex(l =>
+                l === result.company || l.startsWith(result.company + ' ')
+            );
+            if (coIdx >= 0 && coIdx + 1 < lines.length) {
+                const candidate = lines[coIdx + 1];
+                if (candidate && !candidate.includes('·') && !titleSkip.test(candidate)) {
+                    result.title = candidate;
+                }
+            }
+        }
 
         const dotIdx = lines.findIndex(l => l.includes('·'));
         if (dotIdx >= 0) {
@@ -240,8 +261,57 @@ async def scrape_job_details(page, url):
     return data
 
 
+async def _collect_current_page_urls(page, seen):
+    """Scroll the results pane + accumulate /jobs/view/ URLs into seen."""
+    before = len(seen)
+    stagnant = 0
+    for _ in range(8):
+        await page.evaluate("""
+            () => {
+                const links = [...document.querySelectorAll('a[href*="/jobs/view/"]')];
+                if (links.length) links[links.length - 1].scrollIntoView({block: 'end'});
+                const lists = [...document.querySelectorAll('ul, div')]
+                    .filter(d => d.querySelectorAll('a[href*="/jobs/view/"]').length > 3
+                             && d.scrollHeight > d.clientHeight + 100);
+                const list = lists.sort((a,b) =>
+                    b.querySelectorAll('a[href*="/jobs/view/"]').length -
+                    a.querySelectorAll('a[href*="/jobs/view/"]').length)[0];
+                if (list) list.scrollTo(0, list.scrollHeight);
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+        """)
+        await page.wait_for_timeout(1200)
+        links = await page.evaluate(
+            "() => [...document.querySelectorAll('a[href*=\"/jobs/view/\"]')].map(a => a.href.split('?')[0])"
+        )
+        seen.update(links)
+        if len(seen) == before:
+            stagnant += 1
+            if stagnant >= 3:
+                break
+        else:
+            stagnant = 0
+            before = len(seen)
+
+
+async def _click_next_page(page):
+    """Click LinkedIn's pagination Next / next page number. Returns False when on last page."""
+    return await page.evaluate("""() => {
+        const btns = [...document.querySelectorAll('button')];
+        // Preferred: explicit Next button
+        let next = btns.find(b => /^\\s*next\\s*$/i.test(b.innerText || '') && !b.disabled);
+        if (next) { next.scrollIntoView({block: 'center'}); next.click(); return true; }
+        // Fallback: numbered pages — click the page after the currently selected one
+        const nums = btns.filter(b => /^\\s*\\d+\\s*$/.test(b.innerText || ''));
+        if (!nums.length) return false;
+        const cur = nums.findIndex(b => b.getAttribute('aria-current') === 'true'
+            || /active|selected/i.test(b.className));
+        const target = nums[cur >= 0 ? cur + 1 : 0];
+        if (!target || target === nums[cur]) return false;
+        target.scrollIntoView({block: 'center'}); target.click(); return true;
+    }""")
 async def search_urls(page, keywords, location, limit):
-    """Search LinkedIn jobs, return list of job URLs."""
+    """Search LinkedIn jobs, paginating (1, 2, 3 ... Next) — not just page 1."""
     params = {"keywords": keywords, "f_TPR": TIME_FILTER, "sortBy": "DD"}
     if location:
         params["location"] = location
@@ -251,33 +321,21 @@ async def search_urls(page, keywords, location, limit):
     await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
     await page.wait_for_timeout(5000)
 
-    # LinkedIn's results list is virtualized: only a window of cards is rendered
-    # at once. So we gently scroll the last card into view (which triggers the
-    # infinite scroll) and ACCUMULATE every URL we see into a persistent set.
+    # LinkedIn paginates (~25/page) + virtualizes cards per page.
+    # Old code only scrolled page 1 (≈7-11 URLs) and quit — hence 7 vs 214.
     seen = set()
-    stagnant = 0
-    for _ in range(40):
-        await page.evaluate("""
-            () => {
-                const links = [...document.querySelectorAll('a[href*="/jobs/view/"]')];
-                if (links.length) links[links.length - 1].scrollIntoView({block: 'end'});
-                window.scrollTo(0, document.body.scrollHeight);
-            }
-        """)
-        await page.wait_for_timeout(1200)
-        links = await page.evaluate(
-            "() => [...document.querySelectorAll('a[href*=\"/jobs/view/\"]')].map(a => a.href.split('?')[0])"
-        )
-        before = len(seen)
-        seen.update(links)
+    max_pages = max(1, (limit // 25) + 3)
+    for _ in range(max_pages):
+        await _collect_current_page_urls(page, seen)
         if len(seen) >= limit:
             break
-        if len(seen) == before:
-            stagnant += 1
-            if stagnant >= 5:
-                break
-        else:
-            stagnant = 0
+        try:
+            moved = await _click_next_page(page)
+        except Exception:
+            break
+        if not moved:
+            break
+        await page.wait_for_timeout(4000)
 
     return list(seen)[:limit]
 
@@ -290,6 +348,17 @@ async def main():
 
     async with BrowserManager(headless=True) as browser:
         await browser.load_session(SESSION_FILE)
+        # Warm session on feed before search/detail scrapes (reduces authwall hits).
+        await browser.page.goto(
+            "https://www.linkedin.com/feed/",
+            wait_until="domcontentloaded",
+            timeout=NAV_TIMEOUT,
+        )
+        await browser.page.wait_for_timeout(2000)
+        if await is_challenge_page(browser.page):
+            print("Session expired or blocked — rerun: python samples/create_session.py\n")
+            conn.close()
+            return
         print("Session loaded.\n")
 
         # ── Phase 1: Collect URLs from the combined OR search ──

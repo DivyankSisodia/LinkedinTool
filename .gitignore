@@ -8,12 +8,12 @@ __pycache__
 chromedriver
 .DS_Store
 .vscode/
+.env
 .env/
 scrape.py
 creds.json
 venv
 *.zip
-.env
 
 # Test outputs
 *.log
@@ -34,6 +34,10 @@ debug_*.py
 
 # Session files (sensitive cookies)
 linkedin_session.json
+
+# Resume data (private: original PDF + generated variants)
+Divyank_Sisodia_Resume.pdf
+resume/variant_*.md
 
 # Build artifacts
 MANIFEST
